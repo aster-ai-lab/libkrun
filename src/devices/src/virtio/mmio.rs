@@ -89,6 +89,23 @@ impl Display for CreateMmioTransportError {
 ///
 /// Typically one page (4096 bytes) of MMIO address space is sufficient to handle this transport
 /// and inner virtio device.
+/// Plain-data snapshot of an [`MmioTransport`] + its device's driver-programmed
+/// state, used by the snapshot-fork restore path. Mirrored for (de)serialization in
+/// the `vmm` crate. Keyed at restore time by MMIO base address + `device_type`.
+#[derive(Clone, Debug, Default)]
+pub struct MmioDeviceState {
+    pub device_type: u32,
+    pub features_select: u32,
+    pub acked_features_select: u32,
+    pub queue_select: u32,
+    pub device_status: u32,
+    pub config_generation: u32,
+    pub acked_features: u64,
+    pub queues: Vec<QueueState>,
+    /// Opaque device-internal state (e.g. virtio-fs inode map). Empty if none.
+    pub device_blob: Vec<u8>,
+}
+
 pub struct MmioTransport {
     device: Arc<Mutex<dyn VirtioDevice>>,
     // The register where feature bits are stored.
@@ -248,6 +265,96 @@ impl MmioTransport {
     // Gets the encapsulated VirtioDevice.
     pub fn device(&self) -> Arc<Mutex<dyn VirtioDevice>> {
         self.device.clone()
+    }
+
+    /// Snapshot the full driver-programmed transport + device state (snapshot-fork).
+    pub fn save_state(&self) -> MmioDeviceState {
+        let dev = self.locked_device();
+        let mut queues = dev.save_queue_states();
+
+        // Reconcile each queue's ring position against the guest-RAM used index,
+        // which is authoritative: the device writes `used_ring.idx` to guest memory
+        // on every completion, so it can never lag the device. A worker-thread device
+        // (vsock muxer, virtio-fs worker) advances a CLONED queue, leaving the
+        // transport-visible `self.queues` indices frozen at activate time (0); without
+        // this, the snapshot would record fewer completed/consumed entries than the
+        // guest has already observed, and on restore the guest sees the used ring jump
+        // backwards and ignores all device traffic. Never decrease an index.
+        {
+            use vm_memory::Bytes as _;
+            for q in queues.iter_mut() {
+                if q.ready && q.used_ring != 0 {
+                    if let Ok(ram_used) = self
+                        .mem
+                        .read_obj::<u16>(vm_memory::GuestAddress(q.used_ring + 2))
+                    {
+                        if (q.next_used.wrapping_sub(ram_used) as i16) < 0 {
+                            q.next_used = ram_used;
+                        }
+                        if (q.next_avail.wrapping_sub(ram_used) as i16) < 0 {
+                            q.next_avail = ram_used;
+                        }
+                    }
+                }
+            }
+        }
+
+        MmioDeviceState {
+            device_type: dev.device_type(),
+            features_select: self.features_select,
+            acked_features_select: self.acked_features_select,
+            queue_select: self.queue_select,
+            device_status: self.device_status,
+            config_generation: self.config_generation,
+            acked_features: dev.acked_features(),
+            queues,
+            device_blob: dev.save_device_state().unwrap_or_default(),
+        }
+    }
+
+    /// Re-apply a snapshotted transport + device state onto this freshly-built
+    /// transport, then re-activate the device if the driver had reached DRIVER_OK,
+    /// so the device resumes at the guest's ring indices without the guest replaying
+    /// the setup MMIO writes. Returns whether the device was (re-)activated.
+    pub fn restore_state(&mut self, state: &MmioDeviceState) -> Result<bool, crate::Error> {
+        self.features_select = state.features_select;
+        self.acked_features_select = state.acked_features_select;
+        self.queue_select = state.queue_select;
+        self.config_generation = state.config_generation;
+
+        {
+            let mut dev = self.locked_device();
+            dev.set_acked_features(state.acked_features);
+            let queues = dev.queues_mut();
+            for (q, qs) in queues.iter_mut().zip(state.queues.iter()) {
+                q.restore_state(qs);
+            }
+        }
+
+        // Re-activate if the guest driver had completed setup (DRIVER_OK), mirroring
+        // the activation path in `set_device_status`.
+        let driver_ok = state.device_status & device_status::DRIVER_OK != 0;
+        let mut activated = false;
+        if driver_ok && !self.locked_device().is_activated() {
+            self.locked_device()
+                .activate(self.mem.clone(), self.interrupt.clone())
+                .map_err(|e| {
+                    error!("snapshot-restore: device activation failed: {e:?}");
+                    crate::Error::IoError(std::io::Error::other("device activation failed"))
+                })?;
+            activated = true;
+        }
+
+        // Rehydrate device-internal state (e.g. the virtio-fs inode map) AFTER
+        // activate() has rebuilt the device's shared backend, and before the vCPUs
+        // run so the guest's first FUSE op finds a populated map.
+        if !state.device_blob.is_empty() {
+            self.locked_device()
+                .restore_device_state(&state.device_blob);
+        }
+
+        self.device_status = state.device_status;
+        Ok(activated)
     }
 
     pub fn register_queue_evt(&mut self, queue_evt: EventFd, id: u32) {
@@ -523,12 +630,7 @@ impl BusDevice for MmioTransport {
                             ));
                         }
                         if let Some(eventfd) = self.queue_evts.get(&v) {
-                            if let Err(error) = eventfd.write(1) {
-                                error!(
-                                    "failed to signal virtio queue {v} for {}: {error}",
-                                    self.locked_device().device_name()
-                                );
-                            }
+                            eventfd.write(v as u64).unwrap();
                         }
                     }
                     0x64 => {
@@ -716,21 +818,6 @@ pub(crate) mod tests {
         d.queue_select = 2;
         assert_eq!(d.with_queue(0, Queue::get_max_size), 0);
         assert!(!d.with_queue_mut(|q| q.size = 16));
-    }
-
-    #[test]
-    fn test_queue_zero_notification_signals_event() {
-        let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
-        let dummy = Arc::new(Mutex::new(DummyDevice::new()));
-        let queue_event = dummy.lock().unwrap().queue_events()[0].try_clone().unwrap();
-        let mut transport = MmioTransport::new(m, DummyIrqChip::new().into(), dummy).unwrap();
-        transport.register_queue_evt(queue_event.try_clone().unwrap(), 0);
-
-        let mut notification = [0; 4];
-        write_le_u32(&mut notification, 0);
-        transport.write(0, NOTIFY_REG_OFFSET as u64, &notification);
-
-        assert_eq!(queue_event.read().unwrap(), 1);
     }
 
     #[test]

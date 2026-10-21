@@ -23,11 +23,7 @@ use std::os::fd::{BorrowedFd, FromRawFd};
 #[cfg(not(target_os = "windows"))]
 use std::path::PathBuf;
 use std::sync::atomic::AtomicI32;
-#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-use std::thread::JoinHandle;
 
 use super::{Error, Vmm};
 
@@ -191,48 +187,6 @@ struct WhpxIrqChip {
     vcpu_count: u32,
     irq_pending_evt: Arc<utils::eventfd::EventFd>,
     pending_interrupt: PendingInterruptQueue,
-}
-
-#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-pub(crate) struct WindowsPitTimer {
-    stop: Arc<AtomicBool>,
-    worker: Option<JoinHandle<()>>,
-}
-
-#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-impl WindowsPitTimer {
-    fn spawn<F>(worker: F) -> io::Result<Self>
-    where
-        F: FnOnce(Arc<AtomicBool>) + Send + 'static,
-    {
-        let stop = Arc::new(AtomicBool::new(false));
-        let worker_stop = stop.clone();
-        let worker = std::thread::Builder::new()
-            .name("pit-timer".into())
-            .spawn(move || worker(worker_stop))?;
-
-        Ok(Self {
-            stop,
-            worker: Some(worker),
-        })
-    }
-
-    pub(crate) fn stop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(worker) = self.worker.take() {
-            worker.thread().unpark();
-            if worker.join().is_err() {
-                warn!("PIT timer thread panicked during shutdown");
-            }
-        }
-    }
-}
-
-#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-impl Drop for WindowsPitTimer {
-    fn drop(&mut self) {
-        self.stop();
-    }
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
@@ -1538,6 +1492,8 @@ pub enum StartMicrovmError {
     FirmwareRead(io::Error),
     /// Memory regions are overlapping or mmap fails.
     GuestMemoryMmap(vm_memory::Error),
+    /// Cannot create/size the snapshot guest-RAM backing file.
+    SnapshotMemFile(io::Error),
     /// The BZIP2 decoder couldn't decompress the kernel.
     ImageBz2Decoder(io::Error),
     /// Cannot find compressed kernel in file.
@@ -1623,6 +1579,10 @@ pub enum StartMicrovmError {
     RegisterSndDevice(device_manager::mmio::Error),
     /// Cannot initialize a MMIO Vsock Device or add a device to the MMIO Bus.
     RegisterVsockDevice(device_manager::mmio::Error),
+    /// Cannot restore VM or vCPU KVM state from a snapshot.
+    RestoreState(VstateError),
+    /// Cannot restore virtio device state from a snapshot.
+    RestoreDeviceState(device_manager::mmio::Error),
     /// Cannot attest the VM in the Secure Virtualization context.
     SecureVirtAttest(VstateError),
     /// Cannot initialize the Secure Virtualization backend.
@@ -1675,6 +1635,9 @@ impl Display for StartMicrovmError {
             }
             FirmwareRead(ref err) => {
                 write!(f, "Cannot read firmware contents from file: {err}")
+            }
+            SnapshotMemFile(ref err) => {
+                write!(f, "Cannot create snapshot guest-RAM backing file: {err}")
             }
             GuestMemoryMmap(ref err) => {
                 // Remove imbricated quotes from error message.
@@ -1881,6 +1844,14 @@ impl Display for StartMicrovmError {
                     f,
                     "Cannot initialize a MMIO Vsock Device or add a device to the MMIO Bus. {err_msg}"
                 )
+            }
+            RestoreState(ref err) => {
+                let mut err_msg = format!("{err}");
+                err_msg = err_msg.replace('\"', "");
+                write!(f, "Cannot restore VM/vCPU state from snapshot. {err_msg}")
+            }
+            RestoreDeviceState(ref err) => {
+                write!(f, "Cannot restore virtio device state from snapshot. {err}")
             }
             SecureVirtAttest(ref err) => {
                 let mut err_msg = format!("{err}");
@@ -2216,13 +2187,10 @@ pub fn build_microvm(
             fd if fd >= 0 => Some(Box::new(CrtFdWriter(fd))),
             _ => None,
         };
-        let input: Option<Box<dyn devices::legacy::ReadableFd + Send>> = if s.input_fd >= 0 {
+        let input: Option<Box<dyn devices::legacy::ReadableFd + Send>> =
             crate::windows::stdin_reader::WindowsStdinInput::new()
                 .ok()
-                .map(|r| Box::new(r) as Box<dyn devices::legacy::ReadableFd + Send>)
-        } else {
-            None
-        };
+                .map(|r| Box::new(r) as Box<dyn devices::legacy::ReadableFd + Send>);
         serial_devices.push(setup_serial_device(event_manager, input, output)?);
     }
 
@@ -2241,17 +2209,10 @@ pub fn build_microvm(
             } else {
                 Some(Box::new(io::stdout()))
             };
-        // File-backed console capture is output-only. Avoid creating an
-        // unnecessary stdin reader when the caller did not request
-        // interactive input.
         let input: Option<Box<dyn devices::legacy::ReadableFd + Send>> =
-            if vm_resources.console_output.is_none() {
-                crate::windows::stdin_reader::WindowsStdinInput::new()
-                    .ok()
-                    .map(|r| Box::new(r) as Box<dyn devices::legacy::ReadableFd + Send>)
-            } else {
-                None
-            };
+            crate::windows::stdin_reader::WindowsStdinInput::new()
+                .ok()
+                .map(|r| Box::new(r) as Box<dyn devices::legacy::ReadableFd + Send>);
         serial_devices.push(setup_serial_device(event_manager, input, output)?);
     }
 
@@ -2294,13 +2255,8 @@ pub fn build_microvm(
         Arc::new(VcpuList::new(cpu_count as u64))
     };
 
-    #[cfg(target_os = "windows")]
     let mut vcpus;
-    #[cfg(not(target_os = "windows"))]
-    let vcpus;
     let intc: IrqChip;
-    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-    let pit_timer: WindowsPitTimer;
     // For x86_64 we need to create the interrupt controller before calling `KVM_CREATE_VCPUS`
     // while on aarch64 we need to do it the other way around.
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -2323,7 +2279,17 @@ pub fn build_microvm(
             Some(intc.clone()),
         )?;
 
-        let kernel_boot = vm_resources.firmware_config.is_none() && !cfg!(feature = "tee");
+        // In restore mode the vCPU regs/sregs/MSRs/page-tables are all reloaded
+        // from the snapshot state, and the boot-time `setup_sregs` would otherwise
+        // write boot page tables into the (already-populated) snapshot RAM and
+        // corrupt it. Skip boot vCPU configuration entirely when restoring.
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+        let restoring = crate::snapshot::restore_state_path().is_some();
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee"))))]
+        let restoring = false;
+
+        let kernel_boot =
+            vm_resources.firmware_config.is_none() && !cfg!(feature = "tee") && !restoring;
 
         vcpus = create_vcpus_x86_64(
             &vm,
@@ -2354,7 +2320,7 @@ pub fn build_microvm(
             pending_interrupt.clone(),
         )))));
 
-        pit_timer = attach_legacy_devices(
+        attach_legacy_devices(
             &mut pio_device_manager,
             &mut mmio_device_manager,
             intc.clone(),
@@ -2491,8 +2457,6 @@ pub fn build_microvm(
         arch_memory_info,
         kernel_cmdline,
         vcpus_handles: Vec::new(),
-        #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-        pit_timer: Some(pit_timer),
         exit_evt,
         exit_observers: Vec::new(),
         exit_code: exit_code.clone(),
@@ -2639,18 +2603,61 @@ pub fn build_microvm(
     #[cfg(not(target_os = "windows"))]
     log::info!("Final kernel cmdline: {}", vmm.kernel_cmdline.as_str());
 
+    // Restore mode: the cmdline and boot system config are already in the
+    // snapshotted RAM; skip them and instead restore the saved KVM VM + vCPU
+    // state so the vCPUs resume exactly where the template was paused.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    let restoring = crate::snapshot::restore_state_path().is_some();
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee"))))]
+    let restoring = false;
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    if restoring {
+        let state_path = crate::snapshot::restore_state_path().unwrap();
+        let state = crate::snapshot::read_state_file(&state_path)
+            .map_err(StartMicrovmError::SnapshotMemFile)?;
+        vmm.kvm_vm()
+            .restore_state(&state.vm_state)
+            .map_err(StartMicrovmError::RestoreState)?;
+        if state.vcpu_states.len() != vcpus.len() {
+            return Err(StartMicrovmError::SnapshotMemFile(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "snapshot vcpu count mismatch",
+            )));
+        }
+        for (vcpu, vcpu_state) in vcpus.iter_mut().zip(state.vcpu_states.into_iter()) {
+            vcpu.restore_state(vcpu_state)
+                .map_err(StartMicrovmError::RestoreState)?;
+        }
+
+        // Re-apply virtio device state (transport regs + queue indices) onto the
+        // freshly-built devices and re-activate them, so the guest's restored
+        // drivers find their rings where they left off instead of reset to 0.
+        let device_states: Vec<(u64, devices::virtio::MmioDeviceState)> = state
+            .device_states
+            .iter()
+            .map(|(addr, d)| (*addr, devices::virtio::MmioDeviceState::from(d)))
+            .collect();
+        vmm.restore_virtio_states(&device_states)
+            .map_err(StartMicrovmError::RestoreDeviceState)?;
+    }
+
     // Write the kernel command line to guest memory. This is x86_64 specific, since on
     // aarch64 the command line will be specified through the FDT.
     #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
-    load_cmdline(&vmm)?;
+    if !restoring {
+        load_cmdline(&vmm)?;
+    }
 
-    vmm.configure_system(
-        vcpus.as_slice(),
-        &intc,
-        &payload_config.initrd_config,
-        &vm_resources.smbios_oem_strings,
-    )
-    .map_err(StartMicrovmError::Internal)?;
+    if !restoring {
+        vmm.configure_system(
+            vcpus.as_slice(),
+            &intc,
+            &payload_config.initrd_config,
+            &vm_resources.smbios_oem_strings,
+        )
+        .map_err(StartMicrovmError::Internal)?;
+    }
 
     #[cfg(feature = "tee")]
     {
@@ -2846,6 +2853,96 @@ fn load_external_kernel(
     Ok((entry_addr, initrd_config, external_kernel.cmdline.clone()))
 }
 
+/// Create guest memory for the given regions (snapshot-aware). By default the regions are
+/// anonymous mmaps; when `KRUN_SNAPSHOT_MEM_FILE` is set (snapshot-fork mode,
+/// unix only) they are backed by that file with `MAP_SHARED` so the file holds
+/// the live RAM contents — a memory snapshot is then a pause + msync of the
+/// file, and a restore maps the same file `MAP_PRIVATE` (CoW).
+fn create_guest_memory_regions(
+    arch_mem_regions: &[(vm_memory::GuestAddress, usize)],
+) -> std::result::Result<GuestMemoryMmap, StartMicrovmError> {
+    // Restore mode: map the snapshot RAM file MAP_PRIVATE (kernel page-level CoW)
+    // using the layout saved in the state file — guest RAM starts as the template's
+    // RAM, divergent writes stay private to this child. This IS the fork.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    if let (Some(state_path), Some(mem_path)) = (
+        crate::snapshot::restore_state_path(),
+        crate::snapshot::mem_file_path(),
+    ) {
+        let state = crate::snapshot::read_state_file(&state_path)
+            .map_err(StartMicrovmError::SnapshotMemFile)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&mem_path)
+            .map_err(StartMicrovmError::SnapshotMemFile)?;
+        // GuestMemoryMmap::from_regions requires regions sorted by guest address.
+        // The kernel region is appended to mem_layout last (out of address order),
+        // so sort before building.
+        let mut sorted_layout = state.mem_layout.clone();
+        sorted_layout.sort_by_key(|(addr, _, _)| *addr);
+        let mut regions = Vec::with_capacity(sorted_layout.len());
+        for (addr, size, offset) in &sorted_layout {
+            let region_file = file
+                .try_clone()
+                .map_err(StartMicrovmError::SnapshotMemFile)?;
+            // MAP_PRIVATE of the snapshot file = kernel page-level CoW. Reads see
+            // the template's RAM; writes fault a private copy. PROT_READ|WRITE.
+            let mmap_region = vm_memory::mmap::MmapRegionBuilder::new(*size)
+                .with_mmap_prot(libc::PROT_READ | libc::PROT_WRITE)
+                .with_mmap_flags(libc::MAP_NORESERVE | libc::MAP_PRIVATE)
+                .with_file_offset(vm_memory::FileOffset::new(region_file, *offset))
+                .build()
+                .map_err(|e| StartMicrovmError::GuestMemoryMmap(vm_memory::Error::MmapRegion(e)))?;
+            let region =
+                vm_memory::GuestRegionMmap::new(mmap_region, vm_memory::GuestAddress(*addr))
+                    .map_err(StartMicrovmError::GuestMemoryMmap)?;
+            regions.push(region);
+        }
+        let guest_mem =
+            GuestMemoryMmap::from_regions(regions).map_err(StartMicrovmError::GuestMemoryMmap)?;
+        return Ok(guest_mem);
+    }
+
+    #[cfg(all(unix, not(feature = "tee")))]
+    if let Some(path) = crate::snapshot::mem_file_path() {
+        let total: u64 = arch_mem_regions.iter().map(|(_, s)| *s as u64).sum();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .map_err(|e| StartMicrovmError::SnapshotMemFile(e))?;
+        file.set_len(total)
+            .map_err(|e| StartMicrovmError::SnapshotMemFile(e))?;
+
+        let mut offset: u64 = 0;
+        let mut ranges = Vec::with_capacity(arch_mem_regions.len());
+        let mut layout = Vec::with_capacity(arch_mem_regions.len());
+        for (addr, size) in arch_mem_regions {
+            let region_file = file
+                .try_clone()
+                .map_err(|e| StartMicrovmError::SnapshotMemFile(e))?;
+            ranges.push((
+                *addr,
+                *size,
+                Some(vm_memory::FileOffset::new(region_file, offset)),
+            ));
+            layout.push((*addr, *size, offset));
+            offset += *size as u64;
+        }
+
+        let guest_mem = GuestMemoryMmap::from_ranges_with_files(ranges)
+            .map_err(StartMicrovmError::GuestMemoryMmap)?;
+        *crate::snapshot::MEM_BACKING.lock().unwrap() =
+            Some(crate::snapshot::MemBacking { file, layout });
+        return Ok(guest_mem);
+    }
+
+    GuestMemoryMmap::from_ranges(arch_mem_regions).map_err(StartMicrovmError::GuestMemoryMmap)
+}
+
 fn load_payload(
     _vm_resources: &VmResources,
     guest_mem: GuestMemoryMmap,
@@ -2905,6 +3002,66 @@ fn load_payload(
                 } else {
                     return Err(StartMicrovmError::MissingKernelConfig);
                 };
+
+            // Snapshot mode: the libkrunfw kernel region [kernel_guest_addr,
+            // +kernel_size) holds the guest's live kernel image AND its runtime
+            // structures (early page tables, IDT/GDT, kernel .data/.bss). It sits in
+            // the hole arch_memory_regions punches out of the file-backed RAM, so
+            // unless we ALSO file-back it the snapshot loses the kernel and the
+            // restored guest faults reading its own IDT. Copy the kernel into the
+            // snapshot RAM file, map it MAP_SHARED (so guest writes are captured),
+            // and record it in MEM_BACKING.layout — restore then re-maps it
+            // MAP_PRIVATE via the same layout loop as every other region.
+            #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+            {
+                use std::os::unix::fs::FileExt;
+                let mut backing = crate::snapshot::MEM_BACKING.lock().unwrap();
+                if let Some(b) = backing.as_mut() {
+                    let offset = b
+                        .layout
+                        .iter()
+                        .map(|(_, size, off)| off + *size as u64)
+                        .max()
+                        .unwrap_or(0);
+                    b.file
+                        .set_len(offset + kernel_size as u64)
+                        .map_err(StartMicrovmError::SnapshotMemFile)?;
+                    // Seed the file region with the pristine kernel image so the
+                    // template boots correctly; subsequent guest writes land here too.
+                    let kernel_bytes = unsafe {
+                        std::slice::from_raw_parts(kernel_host_addr as *const u8, kernel_size)
+                    };
+                    b.file
+                        .write_all_at(kernel_bytes, offset)
+                        .map_err(StartMicrovmError::SnapshotMemFile)?;
+                    let region_file = b
+                        .file
+                        .try_clone()
+                        .map_err(StartMicrovmError::SnapshotMemFile)?;
+                    let mmap_region = vm_memory::mmap::MmapRegionBuilder::new(kernel_size)
+                        .with_mmap_prot(libc::PROT_READ | libc::PROT_WRITE)
+                        .with_mmap_flags(libc::MAP_NORESERVE | libc::MAP_SHARED)
+                        .with_file_offset(vm_memory::FileOffset::new(region_file, offset))
+                        .build()
+                        .map_err(|e| {
+                            StartMicrovmError::GuestMemoryMmap(vm_memory::Error::MmapRegion(e))
+                        })?;
+                    b.layout
+                        .push((GuestAddress(kernel_guest_addr), kernel_size, offset));
+                    drop(backing);
+                    return Ok((
+                        guest_mem
+                            .insert_region(Arc::new(
+                                GuestRegionMmap::new(mmap_region, GuestAddress(kernel_guest_addr))
+                                    .map_err(StartMicrovmError::GuestMemoryMmap)?,
+                            ))
+                            .map_err(StartMicrovmError::GuestMemoryMmap)?,
+                        GuestAddress(kernel_entry_addr),
+                        None,
+                        None,
+                    ));
+                }
+            }
 
             let kernel_region = unsafe {
                 MmapRegion::build_raw(kernel_host_addr as *mut u8, kernel_size, 0, 0)
@@ -3126,15 +3283,26 @@ pub fn create_guest_memory(
 
     arch_mem_regions.extend(shm_manager.regions());
 
-    let guest_mem = GuestMemoryMmap::from_ranges(&arch_mem_regions)
-        .map_err(StartMicrovmError::GuestMemoryMmap)?;
+    let guest_mem = create_guest_memory_regions(&arch_mem_regions)?;
 
-    let (guest_mem, entry_addr, initrd_config, cmdline) =
-        load_payload(vm_resources, guest_mem, &arch_mem_info, payload)?;
+    // Restore mode: the kernel, cmdline, initrd and firmware are already present
+    // in the snapshotted RAM (mapped CoW above), so skip loading the payload and
+    // writing firmware. The entry address is irrelevant — vCPU registers are
+    // restored from the state file before resume.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    let restoring = crate::snapshot::restore_state_path().is_some();
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee"))))]
+    let restoring = false;
+
+    let (guest_mem, entry_addr, initrd_config, cmdline) = if restoring {
+        (guest_mem, GuestAddress(0), None, None)
+    } else {
+        load_payload(vm_resources, guest_mem, &arch_mem_info, payload)?
+    };
 
     // Only write firmware if data exists AND this isn't an ExternalKernel payload
     // (ExternalKernel does direct kernel boot and doesn't use EFI firmware)
-    if !matches!(payload, Payload::ExternalKernel(_)) {
+    if !restoring && !matches!(payload, Payload::ExternalKernel(_)) {
         if let Some(firmware_data) = firmware_data.as_ref() {
             guest_mem
                 .write(firmware_data, GuestAddress(arch_mem_info.firmware_addr))
@@ -3298,7 +3466,7 @@ fn attach_legacy_devices(
     pio_device_manager: &mut PortIODeviceManager,
     mmio_device_manager: &mut MMIODeviceManager,
     intc: IrqChip,
-) -> std::result::Result<WindowsPitTimer, StartMicrovmError> {
+) -> std::result::Result<(), StartMicrovmError> {
     pio_device_manager
         .register_devices()
         .map_err(Error::LegacyIOBus)
@@ -3358,14 +3526,14 @@ fn attach_legacy_devices(
     // PIT IRQ 0 timer thread (100 Hz).
     // On Windows, IRQ0 begins as a legacy PIC ExtINT via LAPIC LINT0 and later
     // migrates to IOAPIC delivery. Do not inject a blind fixed vector fallback.
-    let pit_timer = WindowsPitTimer::spawn(move |stop| {
+    let intc_clone = intc.clone();
+    std::thread::Builder::new()
+        .name("pit-timer".into())
+        .spawn(move || {
             let mut last_route = "waiting";
             let mut count = 0u64;
 
             loop {
-                if stop.load(Ordering::Acquire) {
-                    break;
-                }
                 let route = if matches!(
                     devices::legacy::windows_apic_stub::query_route(0),
                     Some(route) if !route.masked && route.vector != 0
@@ -3411,10 +3579,7 @@ fn attach_legacy_devices(
                     last_route = route;
                 }
 
-                std::thread::park_timeout(std::time::Duration::from_millis(10));
-                if stop.load(Ordering::Acquire) {
-                    break;
-                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
                 count += 1;
 
                 if count <= 20 || count % 100 == 0 {
@@ -3428,16 +3593,7 @@ fn attach_legacy_devices(
                     ));
                 }
 
-                let irq_result = match intc.lock() {
-                    Ok(intc) => intc.set_irq(Some(0), None),
-                    Err(_) => {
-                        warn!(
-                            "PIT IRQ0 injection stopped because the interrupt controller lock was poisoned"
-                        );
-                        break;
-                    }
-                };
-                if let Err(e) = irq_result {
+                if let Err(e) = intc_clone.lock().unwrap().set_irq(Some(0), None) {
                     windows_irq_debug_log(format!(
                         "[PIT] set_irq_failed tick={} route={} err={:?}",
                         count, last_route, e
@@ -3469,7 +3625,7 @@ fn attach_legacy_devices(
 
     log::debug!("PIT timer thread started (100 Hz IRQ 0 routing)");
 
-    Ok(pit_timer)
+    Ok(())
 }
 
 #[cfg(all(
@@ -3913,7 +4069,7 @@ fn autoconfigure_console_ports(
         if !vm_resources.disable_implicit_console && creating_implicit_console {
             let file = open_windows_console_output_file(path).map_err(OpenConsoleFile)?;
             return Ok(vec![PortDescription::console(
-                None,
+                port_io::input_to_raw_fd_dup(0).ok(),
                 Some(port_io::output_file(file).unwrap()),
                 port_io::term_fixed_size(0, 0),
             )]);
@@ -4349,43 +4505,6 @@ pub mod tests {
     use super::*;
     #[cfg(target_os = "linux")]
     use crate::vmm_config::kernel_bundle::KernelBundle;
-
-    #[test]
-    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-    fn windows_pit_timer_stop_joins_worker() {
-        let worker_exited = Arc::new(AtomicBool::new(false));
-        let worker_exited_clone = worker_exited.clone();
-        let mut timer = WindowsPitTimer::spawn(move |stop| {
-            while !stop.load(Ordering::Acquire) {
-                std::thread::park_timeout(std::time::Duration::from_secs(60));
-            }
-            worker_exited_clone.store(true, Ordering::Release);
-        })
-        .unwrap();
-
-        timer.stop();
-
-        assert!(worker_exited.load(Ordering::Acquire));
-        assert!(timer.worker.is_none());
-    }
-
-    #[test]
-    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-    fn windows_pit_timer_drop_joins_worker() {
-        let worker_exited = Arc::new(AtomicBool::new(false));
-        let worker_exited_clone = worker_exited.clone();
-        let timer = WindowsPitTimer::spawn(move |stop| {
-            while !stop.load(Ordering::Acquire) {
-                std::thread::park_timeout(std::time::Duration::from_secs(60));
-            }
-            worker_exited_clone.store(true, Ordering::Release);
-        })
-        .unwrap();
-
-        drop(timer);
-
-        assert!(worker_exited.load(Ordering::Acquire));
-    }
 
     #[cfg(target_os = "linux")]
     fn default_guest_memory(

@@ -16,6 +16,7 @@ examples/external_kernel
 examples/nitro
 examples/consoles
 examples/rootfs_fedora
+examples/snp-example-data-disk.img
 test-prefix
 /linux-sysroot
 

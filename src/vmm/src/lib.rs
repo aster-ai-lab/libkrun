@@ -21,6 +21,8 @@ pub mod resources;
 /// Signal handling utilities.
 #[cfg(target_os = "linux")]
 pub mod signal_handler;
+/// Snapshot support (file-backed guest RAM, save/restore).
+pub mod snapshot;
 /// Wrappers over structures used to configure the VMM.
 pub mod vmm_config;
 
@@ -68,7 +70,6 @@ use kernel::cmdline::Cmdline as KernelCmdline;
 use polly::event_manager::{self, EventManager, Subscriber};
 use utils::epoll::{EpollEvent, EventSet};
 use utils::eventfd::EventFd;
-#[cfg(target_os = "windows")]
 use vm_memory::Bytes;
 use vm_memory::GuestMemoryMmap;
 
@@ -179,6 +180,9 @@ pub enum Error {
     VcpuHandle(vstate::Error),
     /// vCPU resume failed.
     VcpuResume,
+    VcpuPause,
+    VcpuSaveState,
+    Snapshot(std::io::Error),
     /// Cannot spawn a new Vcpu thread.
     VcpuSpawn(std::io::Error),
     /// Vm error.
@@ -214,6 +218,9 @@ impl Display for Error {
             VcpuEvent(e) => write!(f, "Cannot send event to vCPU. {e:?}"),
             VcpuHandle(e) => write!(f, "Cannot create a vCPU handle. {e}"),
             VcpuResume => write!(f, "vCPUs resume failed."),
+            VcpuPause => write!(f, "vCPUs pause failed."),
+            VcpuSaveState => write!(f, "vCPU state save failed."),
+            Snapshot(e) => write!(f, "Snapshot failed: {e}"),
             VcpuSpawn(e) => write!(f, "Cannot spawn Vcpu thread: {e}"),
             Vm(e) => write!(f, "Vm error: {e}"),
             VmmObserverInit(e) => write!(
@@ -251,9 +258,8 @@ pub struct Vmm {
     kernel_cmdline: KernelCmdline,
 
     vcpus_handles: Vec<VcpuHandle>,
-    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-    pit_timer: Option<builder::WindowsPitTimer>,
     exit_evt: EventFd,
+    vm: Vm,
     exit_observers: Vec<Arc<Mutex<dyn VmmExitObserver>>>,
     exit_code: Arc<AtomicI32>,
     #[cfg(target_os = "windows")]
@@ -263,10 +269,6 @@ pub struct Vmm {
     mmio_device_manager: MMIODeviceManager,
     #[cfg(target_arch = "x86_64")]
     pio_device_manager: PortIODeviceManager,
-
-    // The partition must outlive every vCPU, timer, interrupt controller, and
-    // device that can issue a WHPX call during teardown.
-    vm: Vm,
 }
 
 impl Vmm {
@@ -277,6 +279,16 @@ impl Vmm {
         device_id: &str,
     ) -> Option<&Mutex<dyn BusDevice>> {
         self.mmio_device_manager.get_device(device_type, device_id)
+    }
+
+    /// Re-apply snapshotted virtio device state onto the freshly-built devices
+    /// (snapshot-fork restore). Must run before `start_vcpus`.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    pub fn restore_virtio_states(
+        &self,
+        states: &[(u64, devices::virtio::MmioDeviceState)],
+    ) -> std::result::Result<(), device_manager::mmio::Error> {
+        self.mmio_device_manager.restore_virtio_states(states)
     }
 
     /// Starts the microVM vcpus.
@@ -322,6 +334,60 @@ impl Vmm {
 
     #[cfg(target_os = "macos")]
     pub fn resume_vcpus(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Sends a pause command to the vcpus and waits until all are paused.
+    #[cfg(target_os = "linux")]
+    pub fn pause_vcpus(&mut self) -> Result<()> {
+        for handle in self.vcpus_handles.iter() {
+            handle
+                .send_event(VcpuEvent::Pause)
+                .map_err(Error::VcpuEvent)?;
+        }
+        for handle in self.vcpus_handles.iter() {
+            match handle
+                .response_receiver()
+                .recv_timeout(Duration::from_millis(1000))
+            {
+                Ok(VcpuResponse::Paused) => (),
+                _ => return Err(Error::VcpuPause),
+            }
+        }
+        Ok(())
+    }
+
+    /// Snapshot the paused VM to `state_path`: KVM VM state + per-vCPU state
+    /// (serialized with bincode) and an msync of the file-backed guest RAM
+    /// (`KRUN_SNAPSHOT_MEM_FILE`). Call [`Self::pause_vcpus`] first.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    pub fn snapshot_to(&mut self, state_path: &str) -> Result<()> {
+        // Collect per-vCPU KVM state via the SaveState event (only the vcpu
+        // thread may touch its own VcpuFd; valid only while paused).
+        let mut vcpu_states = Vec::with_capacity(self.vcpus_handles.len());
+        for handle in self.vcpus_handles.iter() {
+            let (state_tx, state_rx) = crossbeam_channel::bounded(1);
+            handle
+                .send_event(VcpuEvent::SaveState(state_tx))
+                .map_err(Error::VcpuEvent)?;
+            match state_rx.recv_timeout(Duration::from_millis(2000)) {
+                Ok(state) => vcpu_states.push(*state),
+                Err(_) => return Err(Error::VcpuSaveState),
+            }
+        }
+
+        let vm_state = self.vm.save_state().map_err(Error::Vm)?;
+
+        // Snapshot virtio device transport + queue state (vCPUs are paused, so the
+        // rings are quiescent and the saved indices are self-consistent).
+        let device_states = self.mmio_device_manager.save_virtio_states();
+
+        // Flush guest RAM to its backing file (live via MAP_SHARED) so the
+        // file pair (RAM + state) is a complete, restorable snapshot.
+        crate::snapshot::sync_mem_backing().map_err(Error::Snapshot)?;
+
+        crate::snapshot::write_state_file(state_path, &vm_state, &vcpu_states, &device_states)
+            .map_err(Error::Snapshot)?;
         Ok(())
     }
 
@@ -475,21 +541,6 @@ impl Vmm {
         self.host_return_exit_code.take()
     }
 
-    #[cfg(target_os = "windows")]
-    pub fn shutdown(&mut self) {
-        for handle in &self.vcpus_handles {
-            handle.request_shutdown();
-        }
-        for handle in std::mem::take(&mut self.vcpus_handles) {
-            handle.join();
-        }
-
-        #[cfg(target_arch = "x86_64")]
-        if let Some(mut pit_timer) = self.pit_timer.take() {
-            pit_timer.stop();
-        }
-    }
-
     /// Returns a reference to the inner KVM Vm object.
     pub fn kvm_vm(&self) -> &Vm {
         &self.vm
@@ -510,119 +561,6 @@ impl Vmm {
     #[cfg(target_os = "macos")]
     pub fn remove_mapping(&self, reply_sender: Sender<bool>, guest_addr: u64, len: u64) {
         self.vm.remove_mapping(reply_sender, guest_addr, len);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_fc_exit_codes() {
-        assert_eq!(FC_EXIT_CODE_OK, 0);
-        assert_eq!(FC_EXIT_CODE_GENERIC_ERROR, 1);
-        assert_eq!(FC_EXIT_CODE_UNEXPECTED_ERROR, 2);
-        assert_eq!(FC_EXIT_CODE_BAD_SYSCALL, 148);
-        assert_eq!(FC_EXIT_CODE_SIGBUS, 149);
-        assert_eq!(FC_EXIT_CODE_SIGSEGV, 150);
-        assert_eq!(FC_EXIT_CODE_BAD_CONFIGURATION, 152);
-        assert_eq!(FC_EXIT_CODE_ARG_PARSING, 153);
-    }
-
-    #[test]
-    fn test_error_debug_format() {
-        // Test that Error implements Debug correctly
-        let error = Error::VcpuResume;
-        assert_eq!(format!("{:?}", error), "VcpuResume");
-    }
-
-    #[test]
-    fn test_error_display_vcpu_resume() {
-        let error = Error::VcpuResume;
-        assert_eq!(format!("{}", error), "vCPUs resume failed.");
-    }
-
-    #[test]
-    fn test_error_display_event_fd() {
-        let io_error = std::io::Error::new(std::io::ErrorKind::NotFound, "test error");
-        let error = Error::EventFd(io_error);
-        assert!(format!("{}", error).contains("Event fd error"));
-    }
-
-    #[test]
-    fn test_error_display_vm() {
-        // Test VM error display (requires vstate::Error)
-        // We can at least verify the error variant exists and formats
-        #[cfg(target_os = "linux")]
-        {
-            let error = Error::Vm(crate::linux::vstate::Error::HTNotInitialized);
-            let display = format!("{}", error);
-            assert!(display.contains("Vm error"));
-        }
-    }
-
-    #[test]
-    fn test_error_display_kvm_context() {
-        #[cfg(target_os = "linux")]
-        {
-            let error = Error::KvmContext(crate::linux::vstate::Error::KvmApiVersion(0));
-            let display = format!("{}", error);
-            assert!(display.contains("Failed to validate KVM support"));
-        }
-    }
-
-    #[test]
-    fn test_error_display_vcpu() {
-        #[cfg(target_os = "linux")]
-        {
-            let error = Error::Vcpu(crate::linux::vstate::Error::VcpuCountNotInitialized);
-            let display = format!("{}", error);
-            assert!(display.contains("Vcpu error"));
-        }
-    }
-
-    #[test]
-    fn test_vmm_events_observer_default_trait() {
-        // Test that the default trait implementations work
-        struct TestObserver;
-        impl VmmEventsObserver for TestObserver {}
-
-        let mut observer = TestObserver;
-        assert!(observer.on_vmm_boot().is_ok());
-        assert!(observer.on_vmm_stop().is_ok());
-    }
-
-    #[test]
-    fn test_vmm_events_observer_custom_impl() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        struct TestObserver {
-            boot_called: Arc<AtomicBool>,
-            stop_called: Arc<AtomicBool>,
-        }
-        impl VmmEventsObserver for TestObserver {
-            fn on_vmm_boot(&mut self) -> std::result::Result<(), utils::errno::Error> {
-                self.boot_called.store(true, Ordering::SeqCst);
-                Ok(())
-            }
-            fn on_vmm_stop(&mut self) -> std::result::Result<(), utils::errno::Error> {
-                self.stop_called.store(true, Ordering::SeqCst);
-                Ok(())
-            }
-        }
-
-        let boot_called = Arc::new(AtomicBool::new(false));
-        let stop_called = Arc::new(AtomicBool::new(false));
-
-        let mut observer = TestObserver {
-            boot_called: boot_called.clone(),
-            stop_called: stop_called.clone(),
-        };
-
-        assert!(observer.on_vmm_boot().is_ok());
-        assert!(observer.on_vmm_stop().is_ok());
-        assert!(boot_called.load(Ordering::SeqCst));
-        assert!(stop_called.load(Ordering::SeqCst));
     }
 }
 

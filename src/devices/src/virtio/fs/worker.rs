@@ -15,7 +15,7 @@ use vm_memory::GuestMemoryMmap;
 use super::super::{FsError, Queue};
 use super::defs::{HPQ_INDEX, REQ_INDEX};
 use super::descriptor_utils::{Reader, Writer};
-use super::passthrough::{self, PassthroughFs};
+use super::passthrough::PassthroughFs;
 use super::server::Server;
 use crate::virtio::{InterruptTransport, VirtioShmRegion};
 
@@ -60,7 +60,7 @@ impl FsWorker {
         interrupt: InterruptTransport,
         mem: GuestMemoryMmap,
         shm_region: Option<VirtioShmRegion>,
-        passthrough_cfg: passthrough::Config,
+        passthrough_fs: Arc<PassthroughFs>,
         stop_fd: EventFd,
         exit_code: Arc<AtomicI32>,
         #[cfg(target_os = "macos")] map_sender: Option<Sender<WorkerMessage>>,
@@ -71,7 +71,7 @@ impl FsWorker {
             interrupt,
             mem,
             shm_region,
-            server: Server::new(PassthroughFs::new(passthrough_cfg).unwrap()),
+            server: Server::new(passthrough_fs),
             stop_fd,
             exit_code,
             #[cfg(target_os = "macos")]

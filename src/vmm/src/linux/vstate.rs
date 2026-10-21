@@ -894,6 +894,7 @@ impl Vm {
 
 #[allow(unused)]
 #[cfg(target_arch = "x86_64")]
+#[derive(serde::Serialize, serde::Deserialize)]
 /// Structure holding VM kvm state.
 pub struct VmState {
     pitstate: kvm_pit_state2,
@@ -1347,6 +1348,12 @@ impl Vcpu {
             .fd
             .get_vcpu_events()
             .map_err(Error::VcpuGetVcpuEvents)?;
+        eprintln!(
+            "[snap-save] vcpu{} saved: rip=0x{:x} rsp=0x{:x} cr0=0x{:x} cr3=0x{:x} cr4=0x{:x} efer=0x{:x} cs.base=0x{:x} cs.sel=0x{:x}",
+            self.id, regs.rip, regs.rsp,
+            sregs.cr0, sregs.cr3, sregs.cr4, sregs.efer,
+            sregs.cs.base, sregs.cs.selector
+        );
         Ok(VcpuState {
             cpuid: self.cpuid.clone(),
             msrs,
@@ -1363,7 +1370,7 @@ impl Vcpu {
 
     #[allow(unused)]
     #[cfg(target_arch = "x86_64")]
-    fn restore_state(&self, state: VcpuState) -> Result<()> {
+    pub fn restore_state(&self, state: VcpuState) -> Result<()> {
         /*
          * Ordering requirements:
          *
@@ -1519,7 +1526,17 @@ impl Vcpu {
                     Err(Error::VcpuUnhandledKvmExit)
                 }
                 VcpuExit::InternalError => {
-                    error!("Received KVM_EXIT_INTERNAL_ERROR signal");
+                    let run = self.fd.get_kvm_run();
+                    // SAFETY: reading the internal-error union after an
+                    // INTERNAL_ERROR exit; the kernel populated it.
+                    let (suberror, ndata, data) = unsafe {
+                        let i = run.__bindgen_anon_1.internal;
+                        (i.suberror, i.ndata, i.data)
+                    };
+                    error!(
+                        "Received KVM_EXIT_INTERNAL_ERROR signal: suberror={suberror} ndata={ndata} data={:x?}",
+                        &data[..(ndata as usize).min(data.len())]
+                    );
                     Err(Error::VcpuUnhandledKvmExit)
                 }
                 VcpuExit::SystemEvent(event, _reason) => {
@@ -1617,6 +1634,9 @@ impl Vcpu {
                 // Move to 'exited' state.
                 state = self.exit(FC_EXIT_CODE_GENERIC_ERROR);
             }
+            // SaveState only applies while paused; ignore in running state.
+            #[cfg(target_arch = "x86_64")]
+            Ok(VcpuEvent::SaveState(_)) => (),
             // All other events or lack thereof have no effect on current 'running' state.
             Err(TryRecvError::Empty) => (),
         }
@@ -1635,6 +1655,19 @@ impl Vcpu {
                     .expect("failed to send resume status");
                 // Move to 'running' state.
                 StateMachine::next(Self::running)
+            }
+            // Paused ---- SaveState ----> Paused (state shipped through the channel)
+            #[cfg(target_arch = "x86_64")]
+            Ok(VcpuEvent::SaveState(state_tx)) => {
+                match self.save_state() {
+                    Ok(state) => {
+                        if state_tx.send(Box::new(state)).is_err() {
+                            error!("failed to send saved vcpu state");
+                        }
+                    }
+                    Err(e) => error!("failed to save vcpu state: {e:?}"),
+                }
+                StateMachine::next(Self::paused)
             }
             // All other events have no effect on current 'paused' state.
             Ok(_) => StateMachine::next(Self::paused),
@@ -1694,10 +1727,46 @@ impl Drop for Vcpu {
     }
 }
 
+/// serde for FamStructWrapper<kvm_cpuid2>: serialize its entries (each entry
+/// derives Serialize via the kvm-bindings serde feature), rebuild on restore.
 #[cfg(target_arch = "x86_64")]
+mod cpuid_serde {
+    use super::CpuId;
+    use kvm_bindings::kvm_cpuid_entry2;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &CpuId, s: S) -> Result<S::Ok, S::Error> {
+        v.as_slice().to_vec().serialize(s)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<CpuId, D::Error> {
+        let entries = Vec::<kvm_cpuid_entry2>::deserialize(d)?;
+        CpuId::from_entries(&entries).map_err(serde::de::Error::custom)
+    }
+}
+
+/// serde for FamStructWrapper<kvm_msrs>.
+#[cfg(target_arch = "x86_64")]
+mod msrs_serde {
+    use super::Msrs;
+    use kvm_bindings::kvm_msr_entry;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &Msrs, s: S) -> Result<S::Ok, S::Error> {
+        v.as_slice().to_vec().serialize(s)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Msrs, D::Error> {
+        let entries = Vec::<kvm_msr_entry>::deserialize(d)?;
+        Msrs::from_entries(&entries).map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[derive(serde::Serialize, serde::Deserialize)]
 /// Structure holding VCPU kvm state.
 pub struct VcpuState {
+    #[serde(with = "cpuid_serde")]
     cpuid: CpuId,
+    #[serde(with = "msrs_serde")]
     msrs: Msrs,
     debug_regs: kvm_debugregs,
     lapic: kvm_lapic_state,
@@ -1718,6 +1787,10 @@ pub enum VcpuEvent {
     Pause,
     /// Event that should resume the Vcpu.
     Resume,
+    /// Save the Vcpu KVM state through the given channel (only valid while paused).
+    /// vCPU KVM-state save/restore is x86_64-only (see [`VcpuState`]).
+    #[cfg(target_arch = "x86_64")]
+    SaveState(crossbeam_channel::Sender<Box<VcpuState>>),
     // Serialize and Deserialize to follow after we get the support from kvm-ioctls.
 }
 

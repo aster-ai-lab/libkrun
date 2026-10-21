@@ -1,6 +1,6 @@
 [package]
 name = "a3s-libkrun-sys"
-version = "0.1.0"
+version = "3.2.7"
 edition = "2021"
 rust-version = "1.77.0"
 description = "Raw Rust bindings for libkrun on Windows (WHPX backend)"

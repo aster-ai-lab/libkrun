@@ -31,7 +31,7 @@ use std::ffi::{c_void, CStr};
 use std::fs::File;
 #[cfg(not(target_os = "windows"))]
 use std::io::IsTerminal;
-#[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "x86_64")))]
+#[cfg(not(target_os = "windows"))]
 use std::os::fd::AsRawFd;
 #[cfg(not(target_os = "windows"))]
 use std::os::fd::{BorrowedFd, FromRawFd, RawFd};
@@ -3005,7 +3005,6 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     }
 
     #[cfg(target_arch = "x86_64")]
-    #[cfg(not(target_os = "windows"))]
     if ctx_cfg.vmr.split_irqchip {
         vmm::worker::start_worker_thread(_vmm.clone(), _receiver.clone()).unwrap();
     }
@@ -3014,6 +3013,46 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     vmm::worker::start_worker_thread(_vmm.clone(), _receiver.clone()).unwrap();
 
     info!("KRUN_BOOT_STAGE: event_loop_entered");
+    // Snapshot trigger (snapshot-fork): when KRUN_SNAPSHOT_SOCK is set, serve
+    // "snapshot <state_path>" requests on that unix socket — pause vCPUs, save
+    // KVM state + msync the file-backed RAM, reply "ok"/"err: ...". The VM stays
+    // paused afterwards (a snapshotted template is then torn down by the host).
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    if let Some(sock_path) = vmm::snapshot::trigger_sock_path() {
+        let vmm_for_snap = _vmm.clone();
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            let _ = std::fs::remove_file(&sock_path);
+            let listener = match std::os::unix::net::UnixListener::bind(&sock_path) {
+                Ok(l) => l,
+                Err(e) => {
+                    error!("snapshot trigger: bind {sock_path} failed: {e}");
+                    return;
+                }
+            };
+            for stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(&stream);
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() {
+                    continue;
+                }
+                let mut out = &stream;
+                if let Some(state_path) = line.trim().strip_prefix("snapshot ") {
+                    let result = {
+                        let mut vmm = vmm_for_snap.lock().unwrap();
+                        vmm.pause_vcpus().and_then(|()| vmm.snapshot_to(state_path))
+                    };
+                    let _ = match result {
+                        Ok(()) => out.write_all(b"ok\n"),
+                        Err(e) => out.write_all(format!("err: {e}\n").as_bytes()),
+                    };
+                } else {
+                    let _ = out.write_all(b"err: expected 'snapshot <state_path>'\n");
+                }
+            }
+        });
+    }
+
     loop {
         match event_manager.run() {
             Ok(_) => {}
@@ -3030,16 +3069,12 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
                 vmm.take_host_return_exit_code()
             };
             if let Some(exit_code) = host_return_exit_code {
-                {
-                    let mut vmm = _vmm.lock().unwrap();
-                    vmm.shutdown();
-                }
-                // EventManager owns subscriber Arcs for the VMM and devices.
-                // Release those before the final VMM Arc so device worker
-                // threads and interrupt transports are destroyed while the
-                // WHPX partition is still valid.
-                drop(event_manager);
-                drop(_vmm);
+                // The opt-in caller exits immediately after draining its
+                // host-side logs. Avoid running incomplete VMM teardown in this
+                // narrow return path; the process releases all resources
+                // moments later.
+                std::mem::forget(_vmm);
+                std::mem::forget(event_manager);
                 return exit_code;
             }
         }

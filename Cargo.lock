@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "a3s-libkrun-sys"
-version = "0.1.0"
+version = "3.2.7"
 dependencies = [
  "windows-sys 0.59.0",
 ]
@@ -107,7 +107,7 @@ checksum = "e16d2d3311acee920a9eb8d33b8cbc1787ce4a264e85f964c2404b969bdcd487"
 
 [[package]]
 name = "arch"
-version = "0.1.0"
+version = "3.2.7"
 dependencies = [
  "arch_gen",
  "kvm-bindings",
@@ -122,7 +122,7 @@ dependencies = [
 
 [[package]]
 name = "arch_gen"
-version = "0.1.0"
+version = "3.2.7"
 
 [[package]]
 name = "async-trait"
@@ -161,6 +161,15 @@ name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
+name = "bincode"
+version = "1.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "bincode"
@@ -384,7 +393,7 @@ dependencies = [
 
 [[package]]
 name = "cpuid"
-version = "0.1.0"
+version = "3.2.7"
 dependencies = [
  "kvm-bindings",
  "kvm-ioctls",
@@ -427,7 +436,7 @@ dependencies = [
 
 [[package]]
 name = "devices"
-version = "0.1.0"
+version = "3.2.7"
 dependencies = [
  "arch",
  "bitflags 1.3.2",
@@ -689,7 +698,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hvf"
-version = "0.1.0"
+version = "3.2.7"
 dependencies = [
  "arch",
  "crossbeam-channel",
@@ -704,7 +713,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a46885ecbabe024b9e6e3ee9ee3a32ad05adf2b6269f45aa912793d9c54c805"
 dependencies = [
  "async-trait",
- "bincode",
+ "bincode 2.0.1",
  "cfg-if",
  "libc",
  "miniz_oxide",
@@ -815,7 +824,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.1.0"
+version = "3.2.7"
 dependencies = [
  "utils",
  "vm-memory",
@@ -823,7 +832,7 @@ dependencies = [
 
 [[package]]
 name = "krun_display"
-version = "0.1.0"
+version = "3.2.7"
 dependencies = [
  "bindgen 0.72.0",
  "bitflags 2.10.0",
@@ -834,7 +843,7 @@ dependencies = [
 
 [[package]]
 name = "krun_input"
-version = "0.1.0"
+version = "3.2.7"
 dependencies = [
  "bindgen 0.72.0",
  "bitflags 2.10.0",
@@ -850,7 +859,9 @@ version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d4b153a59bb3ca930ff8148655b2ef68c34259a623ae08cf2fb9b570b2e45363"
 dependencies = [
+ "serde",
  "vmm-sys-util 0.14.0",
+ "zerocopy",
 ]
 
 [[package]]
@@ -1038,7 +1049,7 @@ dependencies = [
 
 [[package]]
 name = "nitro"
-version = "0.1.0"
+version = "3.2.7"
 dependencies = [
  "devices",
  "libc",
@@ -1531,7 +1542,7 @@ checksum = "8917285742e9f3e1683f0a9c4e6b57960b7314d0b08d30d1ecd426713ee2eee9"
 
 [[package]]
 name = "smbios"
-version = "0.1.0"
+version = "3.2.7"
 dependencies = [
  "vm-memory",
 ]
@@ -1785,7 +1796,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "utils"
-version = "0.1.0"
+version = "3.2.7"
 dependencies = [
  "bitflags 1.3.2",
  "crossbeam-channel",
@@ -1848,10 +1859,11 @@ dependencies = [
 
 [[package]]
 name = "vmm"
-version = "0.1.0"
+version = "3.2.7"
 dependencies = [
  "arch",
  "arch_gen",
+ "bincode 1.3.3",
  "bitfield",
  "bitflags 2.10.0",
  "bzip2",

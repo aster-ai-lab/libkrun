@@ -1,6 +1,6 @@
 [package]
 name = "utils"
-version = "0.1.0"
+version = "3.2.7"
 authors = ["Amazon Firecracker team <firecracker-devel@amazon.com>"]
 edition = "2021"
 
