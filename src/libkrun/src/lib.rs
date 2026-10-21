@@ -2776,6 +2776,14 @@ pub unsafe extern "C" fn krun_set_kernel_console(ctx_id: u32, console_id: *const
     KRUN_SUCCESS
 }
 
+/// Emit one stable-prefixed abort line for an early boot exit so a retained
+/// console log always names the stage that killed the VM. Instrumentation
+/// only — never changes the return code.
+fn boot_abort(stage: &str, code: i32) -> i32 {
+    error!("KRUN_BOOT_ABORT: stage={stage} code={code}");
+    code
+}
+
 #[no_mangle]
 #[allow(unreachable_code)]
 pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
@@ -2791,17 +2799,18 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     #[cfg(feature = "nitro")]
     return krun_start_enter_nitro(ctx_id);
 
+    info!("KRUN_BOOT_STAGE: enter ctx={ctx_id}");
     let mut event_manager = match EventManager::new() {
         Ok(em) => em,
         Err(e) => {
             error!("Unable to create EventManager: {e:?}");
-            return -libc::EINVAL;
+            return boot_abort("event_manager_create", -libc::EINVAL);
         }
     };
 
     let mut ctx_cfg = match CTX_MAP.lock().unwrap().remove(&ctx_id) {
         Some(ctx_cfg) => ctx_cfg,
-        None => return -libc::ENOENT,
+        None => return boot_abort("ctx_lookup", -libc::ENOENT),
     };
 
     if ctx_cfg.vmr.external_kernel.is_none()
@@ -2812,19 +2821,20 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         if let Some(ref krunfw) = ctx_cfg.krunfw {
             if let Err(err) = unsafe { load_krunfw_payload(krunfw, &mut ctx_cfg.vmr) } {
                 eprintln!("Can't load libkrunfw symbols: {err}");
-                return -libc::ENOENT;
+                return boot_abort("krunfw_load", -libc::ENOENT);
             }
         } else {
             eprintln!("Couldn't find or load {KRUNFW_NAME}");
-            return -libc::ENOENT;
+            return boot_abort("krunfw_missing", -libc::ENOENT);
         }
     }
+    info!("KRUN_BOOT_STAGE: kernel_ready");
 
     #[cfg(feature = "blk")]
     for block_cfg in ctx_cfg.get_block_cfg() {
         if ctx_cfg.vmr.add_block_device(block_cfg).is_err() {
             error!("Error configuring virtio-blk for block");
-            return -libc::EINVAL;
+            return boot_abort("blk_config", -libc::EINVAL);
         }
     }
 
@@ -2873,7 +2883,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     ));
 
     if ctx_cfg.vmr.set_kernel_cmdline(kernel_cmdline).is_err() {
-        return -libc::EINVAL;
+        return boot_abort("kernel_cmdline", -libc::EINVAL);
     }
 
     #[cfg(feature = "net")]
@@ -2953,7 +2963,10 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     if let Some(gid) = ctx_cfg.vmm_gid {
         if unsafe { libc::setgid(gid) } != 0 {
             error!("Failed to set gid {gid}");
-            return -std::io::Error::last_os_error().raw_os_error().unwrap();
+            return boot_abort(
+                "setgid",
+                -std::io::Error::last_os_error().raw_os_error().unwrap(),
+            );
         }
     }
 
@@ -2961,7 +2974,10 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     if let Some(uid) = ctx_cfg.vmm_uid {
         if unsafe { libc::setuid(uid) } != 0 {
             error!("Failed to set uid {uid}");
-            return -std::io::Error::last_os_error().raw_os_error().unwrap();
+            return boot_abort(
+                "setuid",
+                -std::io::Error::last_os_error().raw_os_error().unwrap(),
+            );
         }
     }
 
@@ -2973,10 +2989,13 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         ctx_cfg.shutdown_efd,
         sender,
     ) {
-        Ok(vmm) => vmm,
+        Ok(vmm) => {
+            info!("KRUN_BOOT_STAGE: microvm_built");
+            vmm
+        }
         Err(e) => {
             error!("Building the microVM failed: {e:?}");
-            return -libc::EINVAL;
+            return boot_abort("build_microvm", -libc::EINVAL);
         }
     };
 
@@ -2994,12 +3013,13 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     #[cfg(any(feature = "amd-sev", feature = "tdx"))]
     vmm::worker::start_worker_thread(_vmm.clone(), _receiver.clone()).unwrap();
 
+    info!("KRUN_BOOT_STAGE: event_loop_entered");
     loop {
         match event_manager.run() {
             Ok(_) => {}
             Err(e) => {
                 error!("Error in EventManager loop: {e:?}");
-                return -libc::EINVAL;
+                return boot_abort("event_loop", -libc::EINVAL);
             }
         }
 
