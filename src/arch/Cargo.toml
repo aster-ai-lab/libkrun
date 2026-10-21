@@ -1,6 +1,6 @@
 [package]
 name = "arch"
-version = "0.1.0"
+version = "3.2.7"
 authors = ["The Chromium OS Authors"]
 edition = "2021"
 

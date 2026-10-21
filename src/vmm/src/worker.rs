@@ -30,7 +30,7 @@ pub fn start_worker_thread(
         .name("vmm worker".into())
         .spawn(move || loop {
             match receiver.recv() {
-                Err(_) => break,
+                Err(e) => error!("error receiving message from vmm worker thread: {e:?}"),
                 #[cfg(target_os = "macos")]
                 Ok(message) => vmm.lock().unwrap().match_worker_message(message),
                 #[cfg(target_os = "linux")]

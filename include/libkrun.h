@@ -529,14 +529,11 @@ int32_t krun_set_net_mac(uint32_t ctx_id, uint8_t *const c_mac);
  *  Passing NULL (or not calling this function) as "port_map" has a different meaning than
  *  passing an empty array. The first one will instruct libkrun to attempt to expose all
  *  listening ports in the guest to the host, while the second means that no port from
- *  the guest will be exposed to host. Unpublished TCP listeners still succeed in the
- *  guest: the VMM returns -EPERM so krun-guest keeps the already-bound native INET
- *  socket instead of failing listen().
+ *  the guest will be exposed to host.
  *
- *  Exposed ports remain reachable inside the guest on the guest port via
- *  loopback hairpin: a guest `connect()` to `127.0.0.1:<guest_port>` (or
- *  `[::1]:<guest_port>`) is remapped to the host listener. Non-loopback
- *  destinations are not rewritten.
+ *  Exposed ports will only become accessible by their "host_port" in the guest too. This
+ *  means that for a map such as "8080:80", applications running inside the guest will also
+ *  need to access the service through the "8080" port.
  *
  * If past networking mode is used (krun_set_passt_fd was called), port mapping is not supported
  * as an API of libkrun (but you can still do port mapping using command line arguments of passt)

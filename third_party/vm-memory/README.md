@@ -14,8 +14,6 @@ memory of the VM without knowing the implementation details of the VM memory
 provider. Thus VMM components based on these traits can be shared and reused by
 multiple virtualization solutions.
 
-The detailed design of the `vm-memory` crate can be found [here](DESIGN.md).
-
 ### Platform Support
 
 - Arch: x86_64, ARM64, RISCV64

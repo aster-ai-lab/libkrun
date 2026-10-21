@@ -2,9 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fmt;
-#[cfg(target_os = "windows")]
 use std::sync::OnceLock;
-#[cfg(target_os = "windows")]
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Constant to convert seconds to nanoseconds.
@@ -78,11 +76,6 @@ impl LocalTime {
             libc::localtime_s(&mut tm, &secs);
         }
 
-        #[cfg(target_os = "windows")]
-        let nsec = i64::from(timespec.tv_nsec);
-        #[cfg(not(target_os = "windows"))]
-        let nsec = timespec.tv_nsec;
-
         LocalTime {
             sec: tm.tm_sec,
             min: tm.tm_min,
@@ -90,7 +83,7 @@ impl LocalTime {
             mday: tm.tm_mday,
             mon: tm.tm_mon,
             year: tm.tm_year,
-            nsec,
+            nsec: timespec.tv_nsec as i64,
         }
     }
 }

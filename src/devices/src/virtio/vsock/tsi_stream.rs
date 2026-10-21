@@ -199,9 +199,29 @@ impl TsiStreamProxy {
             return 0;
         }
 
-        let addr = match map_listen_addr(req.addr, host_port_map) {
-            Ok(addr) => addr,
-            Err(errno) => return errno,
+        let addr: SockaddrStorage = if let Some(port_map) = host_port_map {
+            if let Some(sin) = req.addr.as_sockaddr_in() {
+                debug!("sockaddr is ipv4");
+                if let Some(port) = port_map.get(&sin.port()) {
+                    SocketAddrV4::new(sin.ip(), *port).into()
+                } else {
+                    req.addr
+                }
+            } else if let Some(sin6) = req.addr.as_sockaddr_in6() {
+                debug!("sockaddr is ipv6");
+                if let Some(port) = port_map.get(&sin6.port()) {
+                    SocketAddrV6::new(sin6.ip(), *port, sin6.flowinfo(), sin6.flowinfo()).into()
+                } else {
+                    req.addr
+                }
+            } else if req.addr.as_unix_addr().is_some() {
+                debug!("sockaddr is unix");
+                req.addr
+            } else {
+                return -libc::EINVAL;
+            }
+        } else {
+            req.addr
         };
 
         let unixsock_path = self.get_unixsock_path(&addr);
@@ -464,19 +484,10 @@ impl Proxy for TsiStreamProxy {
         self.status
     }
 
-    fn connect(
-        &mut self,
-        _pkt: &VsockPacket,
-        req: TsiConnectReq,
-        host_port_map: &Option<HashMap<u16, u16>>,
-    ) -> ProxyUpdate {
+    fn connect(&mut self, _pkt: &VsockPacket, req: TsiConnectReq) -> ProxyUpdate {
         let mut update = ProxyUpdate::default();
 
-        // Hairpin published ports: guest connect to loopback:<guest_port> reaches
-        // the host listener at :<host_port> (Docker-like -p semantics, Box#448).
-        let addr = map_connect_addr(req.addr, host_port_map);
-
-        let result = match connect(self.fd.as_raw_fd(), &addr) {
+        let result = match connect(self.fd.as_raw_fd(), &req.addr) {
             Ok(()) => {
                 debug!("connect: Connected");
                 self.switch_to_connected();
@@ -780,31 +791,22 @@ impl Proxy for TsiStreamProxy {
     }
 
     fn shutdown(&mut self, pkt: &VsockPacket) {
-        let recv_off = pkt.flags() & uapi::VSOCK_FLAGS_SHUTDOWN_RCV != 0;
-        let send_off = pkt.flags() & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0;
-
-        // Forking parents (e.g. nginx master → worker) close their copy of the
-        // accepted socket before the worker uses it. That surfaces as a both-
-        // direction OP_SHUTDOWN while no guest→host data has been sent yet —
-        // the same premature-close window `release` already ignores. Forwarding
-        // that would kill the host TCP socket before the worker can respond.
-        //
-        // Once data has flown, or for an explicit half-close (SHUT_WR / SHUT_RD),
-        // honor the shutdown so host clients see FIN promptly. Unconditionally
-        // ignoring every reverse-proxy OP_SHUTDOWN left the host waiting for the
-        // vsock reaper's 5s deferred removal (#447).
-        if self.parent_id != 0
-            && self.status == ProxyStatus::Connected
-            && self.tx_cnt.0 == 0
-            && recv_off
-            && send_off
-        {
+        // For reverse proxies (accepted connections), ignore OP_SHUTDOWN.
+        // When a guest process forks (e.g., nginx master → worker), the parent
+        // closes its copy of the accepted socket fd, which triggers the kernel's
+        // tsi_release → OP_SHUTDOWN. But the child worker still has the vsock fd
+        // open and will use it for data transfer. Forwarding the shutdown to the
+        // host TCP socket would kill the connection before the worker can respond.
+        if self.parent_id != 0 {
             debug!(
-                "ignoring premature shutdown for reverse proxy: id={}, parent_id={}",
+                "ignoring shutdown for reverse proxy: id={}, parent_id={}",
                 self.id, self.parent_id
             );
             return;
         }
+
+        let recv_off = pkt.flags() & uapi::VSOCK_FLAGS_SHUTDOWN_RCV != 0;
+        let send_off = pkt.flags() & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0;
 
         let how = if recv_off && send_off {
             Shutdown::Both
@@ -966,188 +968,5 @@ impl Drop for TsiStreamProxy {
         if let Some(path) = &self.unixsock_path {
             _ = fs::remove_file(path);
         }
-    }
-}
-
-/// Remap a guest listen address through the TSI host port map.
-///
-/// Host port map contract (`krun_set_port_map` in libkrun.h):
-/// - `None`: legacy auto-publish — bind the guest listen address on the host.
-/// - `Some(map)`: allowlist only. Mapped guest ports are remapped to the host
-///   port. Unmapped TCP/IPv6 ports return `-EPERM` so krun-guest `tsi_listen`
-///   keeps the already-bound native INET socket in the guest. `-EADDRNOTAVAIL`
-///   would make guest `listen()` fail instead of falling back. An empty map
-///   exposes nothing to the host. Unix sockets are unaffected by the TCP map.
-fn map_listen_addr(
-    addr: SockaddrStorage,
-    host_port_map: &Option<HashMap<u16, u16>>,
-) -> Result<SockaddrStorage, i32> {
-    let Some(port_map) = host_port_map else {
-        return Ok(addr);
-    };
-
-    if let Some(sin) = addr.as_sockaddr_in() {
-        debug!("sockaddr is ipv4");
-        if let Some(port) = port_map.get(&sin.port()) {
-            return Ok(SocketAddrV4::new(sin.ip(), *port).into());
-        }
-        debug!(
-            "refusing host bind for unmapped guest ipv4 port {}",
-            sin.port()
-        );
-        return Err(-libc::EPERM);
-    }
-    if let Some(sin6) = addr.as_sockaddr_in6() {
-        debug!("sockaddr is ipv6");
-        if let Some(port) = port_map.get(&sin6.port()) {
-            return Ok(
-                SocketAddrV6::new(sin6.ip(), *port, sin6.flowinfo(), sin6.flowinfo()).into(),
-            );
-        }
-        debug!(
-            "refusing host bind for unmapped guest ipv6 port {}",
-            sin6.port()
-        );
-        return Err(-libc::EPERM);
-    }
-    if addr.as_unix_addr().is_some() {
-        debug!("sockaddr is unix");
-        return Ok(addr);
-    }
-    Err(-libc::EINVAL)
-}
-
-/// Hairpin guest connects aimed at a published guest port on loopback through
-/// the host listener (`host_port` in the map).
-///
-/// Under TSI, `-p host:guest` listens only on the host, so in-guest
-/// `connect(127.0.0.1, guest)` would otherwise get `ECONNREFUSED` (Box#448).
-/// Remapping loopback connects to the host port restores Docker-like reachability
-/// without inventing a second in-guest listen. Non-loopback destinations are
-/// unchanged so ordinary egress is not rewritten.
-fn map_connect_addr(
-    addr: SockaddrStorage,
-    host_port_map: &Option<HashMap<u16, u16>>,
-) -> SockaddrStorage {
-    let Some(port_map) = host_port_map else {
-        return addr;
-    };
-
-    if let Some(sin) = addr.as_sockaddr_in() {
-        if sin.ip().is_loopback() {
-            if let Some(host_port) = port_map.get(&sin.port()) {
-                debug!(
-                    "hairpin connect: 127.0.0.1:{} -> 127.0.0.1:{}",
-                    sin.port(),
-                    host_port
-                );
-                return SocketAddrV4::new(sin.ip(), *host_port).into();
-            }
-        }
-        return addr;
-    }
-    if let Some(sin6) = addr.as_sockaddr_in6() {
-        if sin6.ip().is_loopback() {
-            if let Some(host_port) = port_map.get(&sin6.port()) {
-                debug!(
-                    "hairpin connect: [::1]:{} -> [::1]:{}",
-                    sin6.port(),
-                    host_port
-                );
-                return SocketAddrV6::new(sin6.ip(), *host_port, sin6.flowinfo(), sin6.scope_id())
-                    .into();
-            }
-        }
-        return addr;
-    }
-    addr
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::net::Ipv6Addr;
-
-    fn v4(port: u16) -> SockaddrStorage {
-        SockaddrStorage::from(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port))
-    }
-
-    fn v6(port: u16) -> SockaddrStorage {
-        SockaddrStorage::from(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0))
-    }
-
-    #[test]
-    fn unpublished_ipv4_listen_returns_eperm_for_guest_native_fallback() {
-        let map = Some(HashMap::new());
-        assert_eq!(map_listen_addr(v4(8080), &map), Err(-libc::EPERM));
-        assert_ne!(map_listen_addr(v4(8080), &map), Err(-libc::EADDRNOTAVAIL));
-    }
-
-    #[test]
-    fn unpublished_ipv6_listen_returns_eperm_for_guest_native_fallback() {
-        let map = Some(HashMap::new());
-        assert_eq!(map_listen_addr(v6(8080), &map), Err(-libc::EPERM));
-    }
-
-    #[test]
-    fn mapped_ipv4_listen_uses_the_host_port() {
-        let mut map = HashMap::new();
-        map.insert(80, 8080);
-        let mapped = map_listen_addr(v4(80), &Some(map)).expect("mapped listen");
-        assert_eq!(mapped.as_sockaddr_in().expect("ipv4").port(), 8080);
-    }
-
-    #[test]
-    fn missing_port_map_auto_publishes_the_guest_address() {
-        let addr = v4(8080);
-        let mapped = map_listen_addr(addr, &None).expect("auto-publish");
-        assert_eq!(mapped.as_sockaddr_in().expect("ipv4").port(), 8080);
-    }
-
-    fn loopback_v4(port: u16) -> SockaddrStorage {
-        SockaddrStorage::from(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
-    }
-
-    fn loopback_v6(port: u16) -> SockaddrStorage {
-        SockaddrStorage::from(SocketAddrV6::new(Ipv6Addr::LOCALHOST, port, 0, 0))
-    }
-
-    #[test]
-    fn loopback_connect_to_published_guest_port_hairpins_to_host_port() {
-        let mut map = HashMap::new();
-        map.insert(8080, 18092);
-        let mapped = map_connect_addr(loopback_v4(8080), &Some(map));
-        let sin = mapped.as_sockaddr_in().expect("ipv4");
-        assert_eq!(sin.ip(), Ipv4Addr::LOCALHOST);
-        assert_eq!(sin.port(), 18092);
-    }
-
-    #[test]
-    fn loopback_connect_to_unpublished_port_is_unchanged() {
-        let map = Some(HashMap::new());
-        let addr = loopback_v4(8080);
-        let mapped = map_connect_addr(addr, &map);
-        assert_eq!(mapped.as_sockaddr_in().expect("ipv4").port(), 8080);
-    }
-
-    #[test]
-    fn non_loopback_connect_to_published_guest_port_is_unchanged() {
-        let mut map = HashMap::new();
-        map.insert(8080, 18092);
-        let addr = SockaddrStorage::from(SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 8080));
-        let mapped = map_connect_addr(addr, &Some(map));
-        let sin = mapped.as_sockaddr_in().expect("ipv4");
-        assert_eq!(sin.ip(), Ipv4Addr::new(8, 8, 8, 8));
-        assert_eq!(sin.port(), 8080);
-    }
-
-    #[test]
-    fn loopback_v6_connect_to_published_guest_port_hairpins_to_host_port() {
-        let mut map = HashMap::new();
-        map.insert(8080, 18092);
-        let mapped = map_connect_addr(loopback_v6(8080), &Some(map));
-        let sin6 = mapped.as_sockaddr_in6().expect("ipv6");
-        assert_eq!(sin6.ip(), Ipv6Addr::LOCALHOST);
-        assert_eq!(sin6.port(), 18092);
     }
 }

@@ -417,6 +417,146 @@ impl PassthroughFs {
         })
     }
 
+    /// Snapshot the FUSE inode namespace (nodeid → host path) for snapshot-fork.
+    ///
+    /// Each `InodeData.file` is a live `O_PATH` fd, so while the template VMM is
+    /// paused-but-alive its absolute path is recoverable via
+    /// `readlink(/proc/self/fd/N)`. The opaque blob is consumed by
+    /// [`restore_fs_state`](Self::restore_fs_state) on the forked VM to rebuild the
+    /// same nodeids, so the restored guest's cached nodeids resolve instead of all
+    /// hitting EBADF against an empty inode map.
+    pub fn save_fs_state(&self) -> Vec<u8> {
+        use std::os::unix::ffi::OsStrExt;
+        let inodes = self.inodes.read().unwrap();
+
+        // Paths are stored RELATIVE to the fs root: the template and each fork mount
+        // their rootfs at DIFFERENT host paths (per-box overlay dir), and the
+        // template's dir is gone by restore time. The canonical root is the root
+        // inode's own readlink (handles symlinks/trailing slashes in cfg.root_dir).
+        let root_path = inodes
+            .get(&fuse::ROOT_ID)
+            .and_then(|d| std::fs::read_link(format!("/proc/self/fd/{}", d.file.as_raw_fd())).ok());
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&self.next_inode.load(Ordering::Relaxed).to_le_bytes());
+        out.extend_from_slice(&self.next_handle.load(Ordering::Relaxed).to_le_bytes());
+        let count_pos = out.len();
+        out.extend_from_slice(&0u64.to_le_bytes());
+        let mut count: u64 = 0;
+        for (nodeid, data) in inodes.iter() {
+            let path = match std::fs::read_link(format!("/proc/self/fd/{}", data.file.as_raw_fd()))
+            {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let full = path.as_os_str().as_bytes();
+            // Unlinked-but-open files read back as "<path> (deleted)" and cannot be
+            // reopened by path; skip them — the guest will re-LOOKUP if needed.
+            if full.ends_with(b" (deleted)") || full.contains(&0) {
+                continue;
+            }
+            // Relativize against the root path. The root inode itself stores "".
+            let rel: &[u8] = match &root_path {
+                Some(root) => {
+                    let root_b = root.as_os_str().as_bytes();
+                    if full == root_b {
+                        b""
+                    } else if full.len() > root_b.len()
+                        && full.starts_with(root_b)
+                        && full[root_b.len()] == b'/'
+                    {
+                        &full[root_b.len() + 1..]
+                    } else {
+                        continue; // outside the fs root — not reconstructible
+                    }
+                }
+                None => continue,
+            };
+            out.extend_from_slice(&(*nodeid).to_le_bytes());
+            out.extend_from_slice(&data.refcount.load(Ordering::Relaxed).to_le_bytes());
+            out.extend_from_slice(&(rel.len() as u32).to_le_bytes());
+            out.extend_from_slice(rel);
+            count += 1;
+        }
+        out[count_pos..count_pos + 8].copy_from_slice(&count.to_le_bytes());
+        out
+    }
+
+    /// Rebuild the inode map from a [`save_fs_state`](Self::save_fs_state) blob by
+    /// reopening each path under its original nodeid. Runs on restore after the fs
+    /// device is rebuilt and before the vCPUs resume.
+    pub fn restore_fs_state(&self, blob: &[u8]) {
+        if blob.len() < 24 {
+            return;
+        }
+        let rd = |o: usize| u64::from_le_bytes(blob[o..o + 8].try_into().unwrap());
+        let next_inode = rd(0);
+        let next_handle = rd(8);
+        let count = rd(16);
+        let mut off = 24usize;
+        let mut inodes = self.inodes.write().unwrap();
+        for _ in 0..count {
+            if off + 20 > blob.len() {
+                break;
+            }
+            let nodeid = rd(off);
+            off += 8;
+            let refcount = rd(off);
+            off += 8;
+            let plen = u32::from_le_bytes(blob[off..off + 4].try_into().unwrap()) as usize;
+            off += 4;
+            if off + plen > blob.len() {
+                break;
+            }
+            let rel = &blob[off..off + plen];
+            off += plen;
+            // Rejoin the relative path against THIS fork's rootfs mount (a different
+            // host dir than the template's). Empty rel == the root inode itself.
+            let mut full = self.cfg.root_dir.clone().into_bytes();
+            if !rel.is_empty() {
+                full.push(b'/');
+                full.extend_from_slice(rel);
+            }
+            let cpath = match CString::new(full) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let fd = unsafe {
+                libc::openat(
+                    libc::AT_FDCWD,
+                    cpath.as_ptr(),
+                    libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                continue;
+            }
+            // Safe because we just opened this fd.
+            let f = unsafe { File::from_raw_fd(fd) };
+            let (st, mnt_id) = match statx(&f) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            inodes.insert(
+                nodeid,
+                InodeAltKey {
+                    ino: st.st_ino,
+                    dev: st.st_dev,
+                    mnt_id,
+                },
+                Arc::new(InodeData {
+                    inode: nodeid,
+                    file: f,
+                    dev: st.st_dev,
+                    mnt_id,
+                    refcount: AtomicU64::new(refcount),
+                }),
+            );
+        }
+        self.next_inode.store(next_inode, Ordering::Relaxed);
+        self.next_handle.store(next_handle, Ordering::Relaxed);
+    }
+
     fn open_inode(&self, inode: Inode, mut flags: i32) -> io::Result<File> {
         let data = self
             .inodes
