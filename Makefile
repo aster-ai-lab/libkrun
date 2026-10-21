@@ -88,6 +88,9 @@ endif
 OS = $(shell uname -s)
 ARCH = $(shell uname -m)
 DEBIAN_DIST ?= bookworm
+# Debian unpacks per-triple under aarch64-linux-gnu while uname -m on macOS
+# reports arm64; map once for the sysroot gcc-runtime symlinks below.
+DEB_ARCH = $(if $(filter arm64,$(ARCH)),aarch64,$(ARCH))
 ROOTFS_DIR = linux-sysroot
 
 KRUN_BINARY_Linux = libkrun$(VARIANT).so.$(FULL_VERSION)
@@ -162,6 +165,12 @@ $(ROOTFS_DIR)/.sysroot_ready: $(PACKAGES_FILE)
 		cd $(ROOTFS_TMP) && ar x "$$DEB_NAME" && cd ../..; \
 		tar xf $(ROOTFS_TMP)/data.tar.* -C $(ROOTFS_DIR); \
 		rm -f $(ROOTFS_TMP)/*.deb $(ROOTFS_TMP)/data.tar.* $(ROOTFS_TMP)/control.tar.* $(ROOTFS_TMP)/debian-binary; \
+	done
+	@# libgcc-12-dev unpacks crt*/libgcc into usr/lib/gcc/$(ARCH)-linux-gnu/12/,
+	@# outside the multiarch paths lld searches under --sysroot; expose them
+	@# through symlinks so -static links of init/init resolve.
+	@for f in crtbeginT.o crtbegin.o crtbeginS.o crtend.o crtendS.o libgcc.a libgcc_eh.a libgcc_s.so; do \
+		ln -sf ../gcc/$(DEB_ARCH)-linux-gnu/12/$$f $(ROOTFS_DIR)/usr/lib/$(DEB_ARCH)-linux-gnu/$$f 2>/dev/null || true; \
 	done
 	@touch $@
 
